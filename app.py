@@ -1,7 +1,64 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import json
+import math
+import os
+import re
 from datetime import datetime
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
+class GrowwPriceError(Exception):
+    pass
+
+
+class NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_groww_price(token, exchange, segment, symbol):
+    exchange_symbol = f"{exchange}_{symbol}"
+    params = urlencode({"segment": segment, "exchange_symbols": exchange_symbol})
+    request = Request(
+        f"https://api.groww.in/v1/live-data/ltp?{params}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "X-API-VERSION": "1.0",
+        },
+        method="GET",
+    )
+
+    try:
+        with build_opener(NoRedirects).open(request, timeout=10) as response:
+            data = json.load(response)
+    except HTTPError as error:
+        if error.code in (401, 403):
+            message = "Groww denied access. Check your access token and Trading API access."
+        elif error.code == 429:
+            message = "Groww is limiting requests. Try again shortly."
+        else:
+            message = "Groww could not return a price. Check the exchange, segment and symbol."
+        error.close()
+        raise GrowwPriceError(message) from None
+    except (URLError, OSError, ValueError):
+        raise GrowwPriceError("Could not read a price from Groww. Try again shortly.") from None
+
+    if not isinstance(data, dict) or data.get("status") != "SUCCESS":
+        raise GrowwPriceError("Groww could not return a price. Check the exchange, segment and symbol.")
+
+    payload = data.get("payload")
+    price = payload.get(exchange_symbol) if isinstance(payload, dict) else None
+    if type(price) not in (int, float) or not math.isfinite(price) or price <= 0:
+        raise GrowwPriceError("Groww returned no usable price for this symbol.")
+    return price
+
 
 st.set_page_config(page_title="Groww Smart Algo", page_icon="📈", layout="wide")
 
@@ -11,7 +68,7 @@ def t(en, kn): return kn if KN else en
 
 st.title("📈 Groww Smart Algo – Advanced Dashboard")
 st.caption(t("NSE + BSE | Signals + paper trading | Manual approval workflow", "NSE + BSE | ಸಿಗ್ನಲ್‌ಗಳು + ಪೇಪರ್ ಟ್ರೇಡಿಂಗ್ | ಕೈಯಾರೆ ಅನುಮೋದನೆ"))
-st.warning(t("Starter prototype only: this app does not connect to Groww, fetch live prices, or place real orders. Upload candle data to test signals. Do not use signals as investment advice.", "ಇದು ಪ್ರಾರಂಭಿಕ ಮಾದರಿ ಮಾತ್ರ: ಈ ಆಪ್ Groww ಗೆ ಸಂಪರ್ಕಿಸುವುದಿಲ್ಲ, ಲೈವ್ ಬೆಲೆಗಳನ್ನು ಪಡೆಯುವುದಿಲ್ಲ ಅಥವಾ ನೈಜ ಆರ್ಡರ್‌ಗಳನ್ನು ಮಾಡುವುದಿಲ್ಲ. ಸಿಗ್ನಲ್ ಪರೀಕ್ಷಿಸಲು ಕ್ಯಾಂಡಲ್ ಡೇಟಾ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ. ಇದನ್ನು ಹೂಡಿಕೆ ಸಲಹೆಯಾಗಿ ಪರಿಗಣಿಸಬೇಡಿ."))
+st.warning(t("Groww prices are read-only. The signal scanner uses uploaded candles and approvals are for paper review only.", "Groww ಬೆಲೆಗಳನ್ನು ನೋಡಬಹುದು. ಸಿಗ್ನಲ್‌ಗಳಿಗೆ ಕ್ಯಾಂಡಲ್ CSV ಬಳಸಿ. ಅನುಮೋದನೆ ಪೇಪರ್ ಟ್ರೇಡಿಂಗ್‌ಗೆ ಮಾತ್ರ."))
 
 with st.sidebar:
     st.header(t("Strategy settings", "ತಂತ್ರದ ಸೆಟ್ಟಿಂಗ್‌ಗಳು"))
@@ -25,12 +82,42 @@ with st.sidebar:
     capital = st.number_input(t("Reference capital (₹)", "ಉಲ್ಲೇಖ ಬಂಡವಾಳ (₹)"), 1000, 100000000, 100000, 5000)
     risk_trade = st.number_input(t("Paper risk per trade (%)", "ಪ್ರತಿ ಪೇಪರ್ ಟ್ರೇಡ್ ಅಪಾಯ (%)"), 0.1, 2.0, 0.5, 0.1)
 
-st.subheader(t("Market overview", "ಮಾರುಕಟ್ಟೆ ಅವಲೋಕನ"))
-a,b,c,d = st.columns(4)
-a.metric("NIFTY 50", t("Upload data", "ಡೇಟಾ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ"))
-b.metric("BANK NIFTY", t("Upload data", "ಡೇಟಾ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ"))
-c.metric("SENSEX", t("Upload data", "ಡೇಟಾ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ"))
-d.metric(t("Data status", "ಡೇಟಾ ಸ್ಥಿತಿ"), t("Awaiting CSV", "CSV ನಿರೀಕ್ಷೆಯಲ್ಲಿದೆ"))
+st.subheader(t("Groww live price check", "Groww ಲೈವ್ ಬೆಲೆ ಪರಿಶೀಲನೆ"))
+st.caption(t(
+    "Fetch the latest traded price on demand. Outside market hours it may be from the last trading session.",
+    "ಇತ್ತೀಚಿನ ವಹಿವಾಟಿನ ಬೆಲೆಯನ್ನು ನೋಡಿ. ಮಾರುಕಟ್ಟೆ ಮುಚ್ಚಿದ್ದರೆ ಹಿಂದಿನ ಅವಧಿಯ ಬೆಲೆ ಕಾಣಬಹುದು.",
+))
+token = os.environ.get("GROWW_ACCESS_TOKEN", "").strip()
+if not token:
+    st.info(t(
+        "Add GROWW_ACCESS_TOKEN as a GitHub Codespaces secret for this repository, then restart your Codespace.",
+        "ಈ ರೆಪೊಸಿಟರಿಗೆ GROWW_ACCESS_TOKEN ಅನ್ನು GitHub Codespaces secret ಆಗಿ ಸೇರಿಸಿ. ನಂತರ Codespace ಅನ್ನು ಮರುಪ್ರಾರಂಭಿಸಿ.",
+    ))
+
+with st.form("groww_price_check"):
+    quote_exchange = st.selectbox(t("Price exchange", "ಬೆಲೆಯ ಎಕ್ಸ್‌ಚೇಂಜ್"), ["NSE", "BSE"])
+    quote_segment = st.selectbox(t("Price segment", "ಬೆಲೆಯ ವಿಭಾಗ"), ["CASH", "FNO"])
+    quote_symbol = st.text_input(t("Trading symbol", "ವಹಿವಾಟಿನ ಚಿಹ್ನೆ"), "RELIANCE", max_chars=60)
+    check_price = st.form_submit_button(t("Check live price", "ಲೈವ್ ಬೆಲೆ ಪರಿಶೀಲಿಸಿ"), disabled=not token)
+
+if check_price:
+    symbol = quote_symbol.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9&._-]{0,59}", symbol):
+        st.error(t("Enter a Groww trading symbol, such as RELIANCE.", "RELIANCE ನಂತಹ Groww ವಹಿವಾಟಿನ ಚಿಹ್ನೆಯನ್ನು ನಮೂದಿಸಿ."))
+    elif not re.fullmatch(r"[A-Za-z0-9._~+/=-]{16,4096}", token):
+        st.error(t("Check your GROWW_ACCESS_TOKEN setting.", "GROWW_ACCESS_TOKEN ಸೆಟ್ಟಿಂಗ್ ಪರಿಶೀಲಿಸಿ."))
+    else:
+        try:
+            with st.spinner(t("Checking Groww…", "Groww ಪರಿಶೀಲಿಸಲಾಗುತ್ತಿದೆ…")):
+                price = fetch_groww_price(token, quote_exchange, quote_segment, symbol)
+        except GrowwPriceError as error:
+            st.error(str(error))
+        else:
+            checked_at = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M:%S %p IST")
+            st.metric(f"{quote_exchange} {symbol} · {quote_segment}", f"₹{price:,.2f}")
+            st.caption(t(f"Checked {checked_at}", f"ಪರಿಶೀಲಿಸಿದ ಸಮಯ {checked_at}"))
+
+st.divider()
 
 st.subheader(t("Signal scanner", "ಸಿಗ್ನಲ್ ಸ್ಕ್ಯಾನರ್"))
 st.write(t("Upload OHLCV candles for one symbol. Required columns: datetime, open, high, low, close, volume.", "ಒಂದು ಚಿಹ್ನೆಗೆ OHLCV ಕ್ಯಾಂಡಲ್‌ಗಳನ್ನು ಅಪ್‌ಲೋಡ್ ಮಾಡಿ. ಅಗತ್ಯ ಕಾಲಮ್‌ಗಳು: datetime, open, high, low, close, volume."))
@@ -92,5 +179,5 @@ if file:
 
 st.divider()
 st.subheader(t("Portfolio & trade journal", "ಪೋರ್ಟ್‌ಫೋಲಿಯೊ ಮತ್ತು ಟ್ರೇಡ್ ಜರ್ನಲ್"))
-st.info(t("Portfolio, order status, live P&L, Telegram alerts and Groww connection are not enabled in this starter build. Add them only after verifying current Groww API access and applicable exchange/SEBI requirements.","ಈ ಪ್ರಾರಂಭಿಕ ಆವೃತ್ತಿಯಲ್ಲಿ ಪೋರ್ಟ್‌ಫೋಲಿಯೊ, ಆರ್ಡರ್ ಸ್ಥಿತಿ, ಲೈವ್ P&L, Telegram ಎಚ್ಚರಿಕೆಗಳು ಮತ್ತು Groww ಸಂಪರ್ಕ ಸಕ್ರಿಯವಾಗಿಲ್ಲ. Groww API ಪ್ರವೇಶ ಮತ್ತು ಅನ್ವಯಿಸುವ ಎಕ್ಸ್‌ಚೇಂಜ್/SEBI ನಿಯಮಗಳನ್ನು ಪರಿಶೀಲಿಸಿದ ನಂತರ ಮಾತ್ರ ಸೇರಿಸಿ."))
-st.caption("Prototype build 1.0 | " + datetime.now().strftime("%Y-%m-%d"))
+st.info(t("Portfolio, order status, live P&L and Telegram alerts are pending. The Groww connection only fetches prices.","ಪೋರ್ಟ್‌ಫೋಲಿಯೊ, ಆರ್ಡರ್ ಸ್ಥಿತಿ, ಲೈವ್ P&L ಮತ್ತು Telegram ಎಚ್ಚರಿಕೆಗಳು ಬಾಕಿಯಿವೆ. Groww ಸಂಪರ್ಕ ಬೆಲೆಗಳನ್ನು ಮಾತ್ರ ಪಡೆಯುತ್ತದೆ."))
+st.caption("Read-only build 1.1 | " + datetime.now().strftime("%Y-%m-%d"))
